@@ -89,6 +89,7 @@ RUN writeDirs=" \
     chown -R www-data.www-data ${dir}; \
   done
 
+RUN rpm -e libsolv-tools zypper libzypp container-suseconnect libyaml-cpp0_6 libglib-2_0-0 boost-license1_66_0 libboost_system1_66_0 libboost_thread1_66_0
 EXPOSE 80 443
 
 CMD ["nginx", "-g", "daemon off;"]
