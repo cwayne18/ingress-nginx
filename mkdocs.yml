@@ -130,4 +130,5 @@ nav:
   - Developer Guide:
       - Getting Started: "developer-guide/getting-started.md"
       - Code Overview: "developer-guide/code-overview.md"
+      - Base Image Copa Patch (PoC): "developer-guide/base-image-copa-patch.md"
   - FAQ: "faq.md"

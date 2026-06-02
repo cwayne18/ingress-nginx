@@ -1,0 +1,362 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+#
+# Proof of Concept: Daily base-image (SLES/BCI 16.0) CVE patching with Copacetic.
+#
+# What it does, once a day:
+#   1. Scans the latest Prime `nginx-ingress-controller` image for the target
+#      release line with Trivy, restricted to OS packages (the BCI/SLES base
+#      image layer) and to HIGH/CRITICAL, fixable CVEs.
+#   2. If (and only if) such a CVE exists, it patches the image in place with
+#      project-copacetic/copa-action (Copa patches OS packages only, which is
+#      exactly the "base image layer").
+#   3. Pushes the patched image to the PRIME registry only, using the naming
+#      scheme `nginx-ingress-controller:vX.Y.Z-primeX-patchN`, where primeX is
+#      the latest prime generation already in Prime and patchN is the next
+#      patch iteration for that generation.
+#
+# See docs/developer-guide/base-image-copa-patch.md for details.
+
+name: Base Image Copa Patch (PoC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release line to scan/patch (e.g. v1.15.1). Defaults to the TAG file.'
+        required: false
+        type: string
+  schedule:
+    # Daily at 07:00 UTC (the existing vulnerability scan runs weekly; this is the
+    # daily, action-taking counterpart scoped to the base image layer).
+    - cron: '0 7 * * *'
+
+permissions:
+  contents: read
+
+env:
+  CONTROLLER_IMAGE: nginx-ingress-controller
+  # Copa patches OS packages only; scope the gate to the base image layer.
+  TRIVY_PKG_TYPES: os
+  TRIVY_SEVERITY: 'HIGH,CRITICAL'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 - Daily scan & gate: decide whether there is anything to patch.
+  # ---------------------------------------------------------------------------
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # needed for Vault authentication
+      security-events: write # to keep feeding code scanning (SARIF)
+    outputs:
+      should_patch: ${{ steps.gate.outputs.should_patch }}
+      version: ${{ steps.resolve.outputs.version }}
+      source_image: ${{ steps.resolve.outputs.source_image }}
+      prime_repo: ${{ steps.resolve.outputs.prime_repo }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Reuse the Vault-based Prime credentials already wired into release.yml.
+      # The scan needs Prime read access to pull the source image.
+      - name: Read secrets
+        if: github.repository_owner == 'rancher'
+        uses: rancher-eio/read-vault-secrets@main
+        with:
+          secrets: |
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD
+
+      # For forks, fall back to GHA secrets so the PoC can be exercised elsewhere.
+      - name: Setup Prime credentials (forks)
+        if: github.repository_owner != 'rancher'
+        env:
+          PRIME_REGISTRY: ${{ secrets.PRIME_REGISTRY }}
+          PRIME_REGISTRY_USERNAME: ${{ secrets.PRIME_REGISTRY_USERNAME }}
+          PRIME_REGISTRY_PASSWORD: ${{ secrets.PRIME_REGISTRY_PASSWORD }}
+        run: |
+          echo "PRIME_REGISTRY=$PRIME_REGISTRY" >> "$GITHUB_ENV"
+          echo "PRIME_REGISTRY_USERNAME=$PRIME_REGISTRY_USERNAME" >> "$GITHUB_ENV"
+          echo "PRIME_REGISTRY_PASSWORD=$PRIME_REGISTRY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Login to Prime registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.PRIME_REGISTRY }}
+          username: ${{ env.PRIME_REGISTRY_USERNAME }}
+          password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+
+      # Resolve the release line and the latest prime generation to scan.
+      - name: Resolve target image
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ inputs.version }}"
+          if [[ -z "${VERSION}" ]]; then
+            VERSION="$(head -n1 TAG | tr -d '[:space:]')"
+          fi
+          echo "Release line: ${VERSION}"
+
+          PRIME_REPO="${PRIME_REGISTRY}/rancher/${CONTROLLER_IMAGE}"
+          echo "Prime repo: ${PRIME_REPO}"
+
+          # Find the latest prime generation (primeX) already published for this line.
+          # Tags look like: vX.Y.Z-primeN or vX.Y.Z-primeN-patchM
+          TAGS_JSON="$(skopeo list-tags "docker://${PRIME_REPO}")"
+          LATEST_PRIME="$(
+            echo "${TAGS_JSON}" \
+              | jq -r --arg v "${VERSION}" '.Tags[] | select(test("^" + $v + "-prime[0-9]+(-patch[0-9]+)?$"))' \
+              | sed -E "s/^${VERSION}-prime([0-9]+).*/\1/" \
+              | sort -n | tail -n1
+          )"
+
+          if [[ -z "${LATEST_PRIME}" ]]; then
+            echo "::error::No ${VERSION}-primeX image found in Prime (${PRIME_REPO}); nothing to patch." >&2
+            exit 1
+          fi
+          echo "Latest prime generation: prime${LATEST_PRIME}"
+
+          # Source = latest patch of the latest prime generation if any patches exist,
+          # so fixes accumulate; otherwise the bare primeX image.
+          LATEST_PATCH="$(
+            echo "${TAGS_JSON}" \
+              | jq -r --arg v "${VERSION}" --arg p "${LATEST_PRIME}" \
+                  '.Tags[] | select(test("^" + $v + "-prime" + $p + "-patch[0-9]+$"))' \
+              | sed -E "s/^${VERSION}-prime${LATEST_PRIME}-patch([0-9]+)$/\1/" \
+              | sort -n | tail -n1
+          )"
+
+          if [[ -n "${LATEST_PATCH}" ]]; then
+            SOURCE_TAG="${VERSION}-prime${LATEST_PRIME}-patch${LATEST_PATCH}"
+          else
+            SOURCE_TAG="${VERSION}-prime${LATEST_PRIME}"
+          fi
+          SOURCE_IMAGE="${PRIME_REPO}:${SOURCE_TAG}"
+          echo "Source image to scan/patch: ${SOURCE_IMAGE}"
+
+          {
+            echo "version=${VERSION}"
+            echo "prime_repo=${PRIME_REPO}"
+            echo "source_image=${SOURCE_IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Optional SARIF scan to keep feeding GitHub code scanning, as today.
+      - name: Scan image with Trivy (SARIF)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ steps.resolve.outputs.source_image }}
+          format: 'sarif'
+          output: trivy-results.sarif
+          exit-code: 0
+          scanners: 'vuln'
+          vuln-type: ${{ env.TRIVY_PKG_TYPES }}
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@b1bff81932f5cdfc8695c7752dcee935dcd061c8 # v4.33.0
+        with:
+          token: ${{ github.token }}
+          sarif_file: trivy-results.sarif
+
+      # JSON scan that is BOTH the gate input and the report consumed by copa.
+      # Restricted to OS packages (base image layer) and fixable HIGH/CRITICAL.
+      - name: Scan image with Trivy (JSON report for Copa)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ steps.resolve.outputs.source_image }}
+          format: 'json'
+          output: trivy-report.json
+          exit-code: 0
+          scanners: 'vuln'
+          vuln-type: ${{ env.TRIVY_PKG_TYPES }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+
+      - name: Gate on fixable HIGH/CRITICAL OS CVEs
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-report.json)"
+          echo "Fixable HIGH/CRITICAL OS CVEs in base image layer: ${COUNT}"
+          {
+            echo "## Base image CVE gate"
+            echo ""
+            echo "Image: \`${{ steps.resolve.outputs.source_image }}\`"
+            echo "Fixable HIGH/CRITICAL OS CVEs: **${COUNT}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${COUNT}" -gt 0 ]]; then
+            echo "should_patch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No fixable HIGH/CRITICAL OS CVEs found in the base image layer; nothing to patch."
+            echo "should_patch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Trivy JSON report
+        if: steps.gate.outputs.should_patch == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 & 3 - Compute prime tag, patch with Copa, push to Prime only.
+  # ---------------------------------------------------------------------------
+  patch:
+    needs: scan
+    if: needs.scan.outputs.should_patch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # needed for Vault authentication
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download Trivy JSON report
+        uses: actions/download-artifact@v6
+        with:
+          name: trivy-report
+
+      - name: Read secrets
+        if: github.repository_owner == 'rancher'
+        uses: rancher-eio/read-vault-secrets@main
+        with:
+          secrets: |
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
+            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD
+
+      - name: Setup Prime credentials (forks)
+        if: github.repository_owner != 'rancher'
+        env:
+          PRIME_REGISTRY: ${{ secrets.PRIME_REGISTRY }}
+          PRIME_REGISTRY_USERNAME: ${{ secrets.PRIME_REGISTRY_USERNAME }}
+          PRIME_REGISTRY_PASSWORD: ${{ secrets.PRIME_REGISTRY_PASSWORD }}
+        run: |
+          echo "PRIME_REGISTRY=$PRIME_REGISTRY" >> "$GITHUB_ENV"
+          echo "PRIME_REGISTRY_USERNAME=$PRIME_REGISTRY_USERNAME" >> "$GITHUB_ENV"
+          echo "PRIME_REGISTRY_PASSWORD=$PRIME_REGISTRY_PASSWORD" >> "$GITHUB_ENV"
+
+      # Prime only: deliberately no DockerHub login here, mirroring the existing
+      # `-prime` suffix policy (prime-suffixed tags never go to DockerHub).
+      - name: Login to Prime registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.PRIME_REGISTRY }}
+          username: ${{ env.PRIME_REGISTRY_USERNAME }}
+          password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+
+      # Stage 2 - compute vX.Y.Z-primeX-patchN.
+      - name: Compute patched tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.scan.outputs.version }}"
+          PRIME_REPO="${{ needs.scan.outputs.prime_repo }}"
+          SOURCE_IMAGE="${{ needs.scan.outputs.source_image }}"
+
+          TAGS_JSON="$(skopeo list-tags "docker://${PRIME_REPO}")"
+
+          # X = latest prime generation already in Prime for this release line.
+          PRIME_NUM="$(
+            echo "${TAGS_JSON}" \
+              | jq -r --arg v "${VERSION}" '.Tags[] | select(test("^" + $v + "-prime[0-9]+(-patch[0-9]+)?$"))' \
+              | sed -E "s/^${VERSION}-prime([0-9]+).*/\1/" \
+              | sort -n | tail -n1
+          )"
+          if [[ -z "${PRIME_NUM}" ]]; then
+            echo "::error::No ${VERSION}-primeX image found in Prime; nothing to patch." >&2
+            exit 1
+          fi
+
+          # N = (max existing patch for this primeX) + 1, else 1.
+          LATEST_PATCH="$(
+            echo "${TAGS_JSON}" \
+              | jq -r --arg v "${VERSION}" --arg p "${PRIME_NUM}" \
+                  '.Tags[] | select(test("^" + $v + "-prime" + $p + "-patch[0-9]+$"))' \
+              | sed -E "s/^${VERSION}-prime${PRIME_NUM}-patch([0-9]+)$/\1/" \
+              | sort -n | tail -n1
+          )"
+          if [[ -n "${LATEST_PATCH}" ]]; then
+            PATCH_NUM=$((LATEST_PATCH + 1))
+          else
+            PATCH_NUM=1
+          fi
+
+          PATCHED_TAG="${VERSION}-prime${PRIME_NUM}-patch${PATCH_NUM}"
+          PATCHED_IMAGE="${PRIME_REPO}:${PATCHED_TAG}"
+          echo "Source image:  ${SOURCE_IMAGE}"
+          echo "Patched tag:   ${PATCHED_TAG}"
+          echo "Patched image: ${PATCHED_IMAGE}"
+          {
+            echo "patched_tag=${PATCHED_TAG}"
+            echo "patched_image=${PATCHED_IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Stage 3 - patch OS packages with Copacetic using the Trivy JSON report.
+      - name: Patch image with Copa
+        id: copa
+        uses: project-copacetic/copa-action@3843e22efdca421adb37aa8dec103a0f1db68544 # v1.2.1
+        with:
+          image: ${{ needs.scan.outputs.source_image }}
+          image-report: 'trivy-report.json'
+          patched-tag: ${{ steps.tag.outputs.patched_tag }}
+          timeout: '10m'
+
+      # Tag the locally-produced patched image to the Prime repo and push.
+      - name: Push patched image to Prime
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCHED_LOCAL="${{ steps.copa.outputs.patched-image }}"
+          PATCHED_IMAGE="${{ steps.tag.outputs.patched_image }}"
+          echo "Copa produced: ${PATCHED_LOCAL}"
+          docker tag "${PATCHED_LOCAL}" "${PATCHED_IMAGE}"
+          docker push "${PATCHED_IMAGE}"
+
+      # Re-scan the patched image to prove the CVEs are resolved.
+      - name: Re-scan patched image (verification)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ${{ steps.tag.outputs.patched_image }}
+          format: 'json'
+          output: trivy-after.json
+          exit-code: 0
+          scanners: 'vuln'
+          vuln-type: ${{ env.TRIVY_PKG_TYPES }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+
+      - name: Summarize patch result
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-report.json)"
+          AFTER="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-after.json)"
+          {
+            echo "## Copa base image patch"
+            echo ""
+            echo "Source image:  \`${{ needs.scan.outputs.source_image }}\`"
+            echo "Patched image: \`${{ steps.tag.outputs.patched_image }}\`"
+            echo ""
+            echo "Fixable HIGH/CRITICAL OS CVEs before: **${BEFORE}**"
+            echo "Fixable HIGH/CRITICAL OS CVEs after:  **${AFTER}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${AFTER}" -gt 0 ]]; then
+            echo "::warning::Patched image still reports ${AFTER} fixable HIGH/CRITICAL OS CVE(s)."
+          fi
