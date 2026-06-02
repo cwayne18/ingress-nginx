@@ -1,7 +1,7 @@
 # Daily base-image CVE patching with Copacetic (PoC)
 
 This document describes a proof of concept that keeps ahead of CVEs landing in
-our base image (SUSE BCI / SLES 16.0) by **automatically patching the base image
+our base image (SUSE BCI/SLES 16.0) by **automatically patching the base image
 layer every day** with [Copacetic](https://github.com/project-copacetic/copacetic)
 via the [`copa-action`](https://github.com/project-copacetic/copa-action).
 
@@ -110,5 +110,7 @@ No DockerHub credentials are needed or used by this workflow.
 - **Only fixable, OS-level CVEs are addressed** — by design.
 - **Provenance (out of PoC scope):** patched Prime images should eventually be
   signed and have their SBOM refreshed the same way releases are.
-- All third-party actions (`copa-action`, `trivy-action`) are pinned by commit
-  SHA, consistent with the rest of the repository.
+- The security-sensitive third-party scanner/patcher actions (`copa-action`,
+  `trivy-action`) are pinned by commit SHA. First-party `actions/*` and
+  `docker/*` actions follow the existing repository convention of referencing
+  major-version tags (as in `release.yml`).
