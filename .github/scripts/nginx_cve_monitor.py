@@ -150,7 +150,9 @@ def tracked_in_copilot_tasks(repository: str, token: str) -> set[str]:
     return tracked
 
 
-def render_prompt(repository: str, nginx_version: str, cve: dict) -> str:
+def render_prompt(
+    repository: str, nginx_version: str, cve: dict, base_branch: str
+) -> str:
     cve_id = cve["id"]
     description = english_description(cve)
     references = [
@@ -186,7 +188,7 @@ Analyze and remediate upstream nginx vulnerability **{cve_id}** for `{repository
 3. If affected, find the authoritative upstream nginx fix and adapt it to nginx {nginx_version}. Preserve the purpose of the upstream fix; do not replace it with a workaround, version bump, unrelated refactor, or a patch copied without provenance.
 4. Add the smallest applicable backport under `images/nginx/rootfs/patches/` using the next numeric prefix and the filename `<prefix>_nginx-{nginx_version}-{cve_id}.patch`. Use `git format-patch`-style metadata and identify the upstream commit/source and affected CVE in the patch header.
 5. Validate that every patch in `images/nginx/rootfs/patches/` applies cleanly in order to a pristine nginx {nginx_version} source tree. Run the base image build or the narrowest equivalent build that actually exercises the patched source.
-6. Open a PR against `hardened-nginx-1.15.x` that follows `.github/PULL_REQUEST_TEMPLATE.md`, links this issue, explains the affected-path analysis, cites upstream evidence, and records the validation performed.
+6. Open a PR against `{base_branch}` that follows `.github/PULL_REQUEST_TEMPLATE.md`, links this issue, explains the affected-path analysis, cites upstream evidence, and records the validation performed.
 7. Do not merge the PR. Do not modify unrelated files. Do not create a PR until the impact analysis confirms the image is affected and the backport has been validated.
 8. If the image is not affected, finish the task with a report containing the evidence and reasoning (including vulnerable versions, modules, and relevant local code), without opening a PR or changing files.
 """
@@ -208,6 +210,11 @@ def parse_arguments() -> argparse.Namespace:
         default=Path("images/nginx/rootfs/version.sh"),
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--base-branch",
+        default="hardened-nginx-1.15.x",
+        help="Branch the dispatched task should base its PR against.",
+    )
     return parser.parse_args()
 
 
@@ -257,7 +264,9 @@ def main() -> int:
         candidates.append(
             {
                 "cve_id": cve_id,
-                "prompt": render_prompt(repository, nginx_version, cve),
+                "prompt": render_prompt(
+                    repository, nginx_version, cve, args.base_branch
+                ),
             }
         )
 
