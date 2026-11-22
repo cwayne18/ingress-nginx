@@ -14,7 +14,7 @@ from pathlib import Path
 
 NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 GITHUB_API_URL = "https://api.github.com"
-NGINX_CPE = "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*"
+NGINX_CPE = "cpe:2.3:a:f5:nginx_open_source:*:*:*:*:*:*:*:*"
 RESULTS_PER_PAGE = 2000
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 TERMINAL_COPILOT_STATES = {"cancelled", "failed", "timed_out"}
