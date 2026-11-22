@@ -49,7 +49,7 @@ def fetch_nginx_cves(lookback_days: int, api_key: str | None) -> list[dict]:
     while True:
         query = urllib.parse.urlencode(
             {
-                "cpeName": NGINX_CPE,
+                "virtualMatchString": NGINX_CPE,
                 "lastModStartDate": start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "lastModEndDate": end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "resultsPerPage": RESULTS_PER_PAGE,
