@@ -17,6 +17,9 @@ GITHUB_API_URL = "https://api.github.com"
 NGINX_CPE = "cpe:2.3:a:f5:nginx_open_source:*:*:*:*:*:*:*:*"
 RESULTS_PER_PAGE = 2000
 CVE_PATTERN = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
+CVE_MARKER_PATTERN = re.compile(
+    r"<!--\s*nginx-cve-monitor:\s*(CVE-\d{4}-\d{4,})\s*-->", re.IGNORECASE
+)
 TERMINAL_COPILOT_STATES = {"cancelled", "failed", "timed_out"}
 
 
@@ -97,16 +100,19 @@ def patched_cves(patch_directory: Path) -> set[str]:
 
 
 def tracked_in_github(repository: str, cve_id: str, token: str) -> bool:
-    query = urllib.parse.quote(f'repo:{repository} "{cve_id}"')
-    url = f"{GITHUB_API_URL}/search/issues?q={query}"
-    result = request_json(
-        url,
-        {
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    return int(result.get("total_count", 0)) > 0
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # GitHub's search API now requires an explicit is:issue or
+    # is:pull-request qualifier, so check both issues and PRs.
+    for kind in ("is:issue", "is:pull-request"):
+        query = urllib.parse.quote(f'repo:{repository} {kind} "{cve_id}"')
+        url = f"{GITHUB_API_URL}/search/issues?q={query}"
+        result = request_json(url, headers)
+        if int(result.get("total_count", 0)) > 0:
+            return True
+    return False
 
 
 def tracked_in_copilot_tasks(repository: str, token: str) -> set[str]:
@@ -129,13 +135,18 @@ def tracked_in_copilot_tasks(repository: str, token: str) -> set[str]:
     for task in tasks:
         if task.get("state") in TERMINAL_COPILOT_STATES:
             continue
-        task_details = task
-        if task.get("id"):
-            task_details = request_json(f"{base_url}/{task['id']}", headers)
-        tracked.update(
-            match.upper()
-            for match in CVE_PATTERN.findall(json.dumps(task_details, sort_keys=True))
-        )
+        if not task.get("id"):
+            continue
+        task_details = request_json(f"{base_url}/{task['id']}", headers)
+        # Only trust the exact marker this script embeds in the prompt it
+        # dispatched, rather than scanning the whole task/session payload:
+        # PR bodies and prompts often quote nginx changelog excerpts that
+        # mention unrelated CVE IDs, which would otherwise be mistaken for
+        # already-dispatched CVEs.
+        for session in task_details.get("sessions", []):
+            match = CVE_MARKER_PATTERN.search(session.get("prompt") or "")
+            if match:
+                tracked.add(match.group(1).upper())
     return tracked
 
 
